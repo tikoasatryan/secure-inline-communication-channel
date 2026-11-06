@@ -1,213 +1,177 @@
 # Secure Inline Communication Channel
 
-**A Linux-based secure inline communication system implemented in C**
-
-## Overview
-
-This project implements a prototype of a secure inline communication channel between two hosts through two intermediate network devices.
-
-The system intercepts selected TCP/IPv4 packets, establishes a shared cryptographic session key between the intermediate devices using Diffie–Hellman key exchange, and protects TCP payloads using AES-256-GCM encryption.
-
-The original IP and TCP headers are preserved during packet processing. The receiving device authenticates and decrypts the protected payload before forwarding the restored packet to its destination.
-
-The project is developed in C using Linux networking capabilities and OpenSSL.
-
-## Network Architecture
-
-The communication follows this topology:
+A Linux-based C networking project prototype for a protected inline path:
 
 ```text
-+-------+       +----------+       +----------+       +-------+
-|  PC1  | ----> | Device 1 | ----> | Device 2 | ----> |  PC2  |
-|Sender |       | Encryptor|       |Decryptor |       |Receiver
-+-------+       +----------+       +----------+       +-------+
-                     |                   |
-                     +--- Secure Session+
+PC1  ->  Device1  ->  Device2  ->  PC2
 ```
 
-### Components
+The repository is designed to be developed on macOS and executed inside a Linux VM. Linux network namespaces, veth interfaces and Netfilter/NFQUEUE require a Linux kernel; they cannot run natively on macOS.
 
-- **PC1 (Sender):** Generates and sends TCP traffic.
-- **Device1 (Encryptor):** Intercepts selected TCP packets and encrypts their payloads.
-- **Device2 (Decryptor):** Verifies authentication tags, decrypts payloads and restores packets.
-- **PC2 (Receiver):** Receives the original TCP traffic.
+## Current implementation status
 
-The complete topology is simulated using Linux network namespaces and virtual Ethernet (veth) interfaces.
+This repository is a **starter implementation**, not a finished transparent inline encryptor.
 
-## Technologies Used
-
-| Technology | Purpose |
+| Component | Status |
 |---|---|
-| C | Main programming language |
-| Linux Network Namespaces | Network isolation |
-| Virtual Ethernet (veth) | Virtual network connections |
-| TCP/IPv4 | Communication protocol |
-| POSIX Sockets | TCP client/server |
-| Netfilter / NFQUEUE | Packet interception |
-| X25519 | Diffie–Hellman key exchange |
-| HKDF-SHA256 | Session key derivation |
-| AES-256-GCM | Payload encryption and authentication |
-| OpenSSL | Cryptographic operations |
-| GCC / Make | Compilation and build automation |
+| Four-namespace topology script | Implemented |
+| TCP file sender and receiver in C | Implemented |
+| X25519 shared-secret test | Implemented |
+| HKDF-SHA256 key derivation | Implemented |
+| AES-256-GCM encrypt/decrypt test | Implemented |
+| NFQUEUE packet interception | Scaffold / next milestone |
+| Transparent TCP sequence/retransmission handling | Not implemented |
+| End-to-end inline integration | Not implemented |
 
-## Security Design
+Do not describe the packet interception or transparent encryption features as complete until they have been implemented and tested.
 
-### 1. Key Exchange
+## Important design note
 
-Device1 and Device2 establish a shared secret using X25519 key exchange.
+The assignment asks to append a 16-byte GCM tag to each encrypted TCP payload while preserving the original IP and TCP headers and forwarding packets directly. Adding bytes to a TCP segment changes TCP sequence-space. A correct transparent implementation must also handle TCP sequence/acknowledgment translation, retransmissions, segmentation/coalescing, MTU limits, and both traffic directions. Simply changing a packet's payload length and checksum will not produce a reliable transparent TCP connection.
 
-The shared secret is processed using HKDF-SHA256 to derive session encryption keys.
+The nonce must also be available to the receiver and must never repeat with the same AES-GCM key. The project documentation should state the nonce/framing design agreed with the instructor. X25519 alone does not authenticate peers; the handshake needs authentication (for example, a pre-shared-key-based transcript MAC or signatures).
 
-### 2. Payload Encryption
-
-Device1 encrypts only the TCP payload using AES-256-GCM.
-
-The authentication tag is appended to the encrypted payload.
-
-The original IP and TCP headers are preserved.
-
-### 3. Payload Decryption
-
-Device2 receives the protected packet, verifies its authentication tag and decrypts the payload.
-
-If authentication fails, the packet is discarded.
-
-### 4. Nonce Management
-
-The implementation must guarantee nonce uniqueness for each independent encryption operation within a session, including correct handling of TCP retransmissions.
-
-## Packet Processing
-
-**Original packet:**
+## Repository layout
 
 ```text
-+------------+------------+------------------+
-| IP Header  | TCP Header | Original Payload |
-+------------+------------+------------------+
+network/       Linux namespace and veth setup/cleanup scripts
+src/common/    cryptographic helpers
+src/sender/    TCP file sender
+src/receiver/  TCP file receiver
+src/device1/   future NFQUEUE encryptor
+src/device2/   future NFQUEUE decryptor
+tests/         cryptographic and transfer tests
+docs/          architecture and implementation notes
 ```
 
-**Protected packet:**
+## macOS development setup
 
-```text
-+------------+------------+-------------+-------------+
-| IP Header  | TCP Header | Ciphertext  | GCM Tag     |
-+------------+------------+-------------+-------------+
-```
+1. Install Git and a code editor such as VS Code on macOS.
+2. Install UTM: https://mac.getutm.app/
+3. Create an Ubuntu 24.04 ARM64 VM on Apple Silicon, or Ubuntu 24.04 x86_64 on an Intel Mac.
+4. Give the VM at least 2 CPU cores, 4 GB RAM and 25 GB disk.
+5. Boot Ubuntu and install the dependencies below.
+6. Copy this repository into the VM (shared folder, `git clone`, or ZIP transfer).
 
-The receiving device restores the original payload and recalculates the required IP and TCP checksums.
+The Linux VM is where all network namespace and NFQUEUE commands must run.
 
-## Project Structure
-
-```text
-secure-inline-communication-channel/
-├── network/
-│   ├── setup.sh
-│   ├── cleanup.sh
-│   └── configure_firewall.sh
-├── src/
-│   ├── common/
-│   ├── device1/
-│   ├── device2/
-│   ├── sender/
-│   └── receiver/
-├── tests/
-├── docs/
-├── Makefile
-├── README.md
-└── .gitignore
-```
-
-## Installation
-
-The project targets Linux systems.
-
-Install the required dependencies on Ubuntu/Debian:
+### Install dependencies on Ubuntu
 
 ```bash
 sudo apt update
-
-sudo apt install -y \
-    build-essential \
-    gcc \
-    make \
-    libssl-dev \
-    libnetfilter-queue-dev \
-    libmnl-dev \
-    iproute2 \
-    iptables \
-    tcpdump
+sudo apt install -y build-essential gcc make git \
+  libssl-dev libnetfilter-queue-dev libmnl-dev \
+  iproute2 iptables nftables tcpdump ethtool
 ```
 
-## Compilation
+## Build
 
-Clone the repository:
-
-```bash
-git clone https://github.com/YOUR_USERNAME/secure-inline-communication-channel.git
-
-cd secure-inline-communication-channel
-```
-
-Compile the project:
+From the repository root:
 
 ```bash
 make
 ```
 
-## Running the Project
+This builds:
+- `build/sender`
+- `build/receiver`
+- `build/test_crypto`
 
-Create the network topology:
+## Run the basic TCP file-transfer test
+
+Open two Ubuntu terminal windows.
+
+Terminal 1 — start the receiver:
 
 ```bash
+mkdir -p receiver
+./build/receiver 9000 receiver/received.bin
+```
+
+Terminal 2 — send a file:
+
+```bash
+mkdir -p sender
+printf 'Hello from the secure inline channel project\n' > sender/example.txt
+./build/sender 127.0.0.1 9000 sender/example.txt
+```
+
+Compare the files:
+
+```bash
+cmp sender/example.txt receiver/received.bin
+sha256sum sender/example.txt receiver/received.bin
+```
+
+The hashes should match.
+
+## Run the cryptographic self-test
+
+```bash
+./build/test_crypto
+```
+
+The test generates two X25519 key pairs, derives a common secret on both sides, derives an AES key using HKDF-SHA256, and checks AES-256-GCM encryption/decryption plus rejection of a modified tag.
+
+## Create the virtual network
+
+Run only inside the Ubuntu VM:
+
+```bash
+sudo ./network/cleanup.sh
 sudo ./network/setup.sh
 ```
 
-Start the receiver and sender in their respective network namespaces.
+Check the namespaces and interfaces:
 
-Start Device1 and Device2 to establish the secure session and process protected traffic.
+```bash
+sudo ip netns list
+sudo ip netns exec pc1 ip addr
+sudo ip netns exec device1 ip addr
+sudo ip netns exec device2 ip addr
+sudo ip netns exec pc2 ip addr
+```
 
-**Note:** Exact execution commands will be added as the implementation is completed.
+Test routed connectivity:
 
-Clean up the network topology:
+```bash
+sudo ip netns exec pc1 ping -c 3 10.0.2.2
+```
+
+At this milestone, traffic is routed normally. It is **not yet encrypted**.
+
+Remove the topology:
 
 ```bash
 sudo ./network/cleanup.sh
 ```
 
-## Testing
+## GitHub
 
-The following tests are planned:
+Create an empty repository on GitHub, then from this directory:
 
-- Network namespace connectivity.
-- TCP file transfer.
-- Diffie–Hellman shared secret agreement.
-- AES-256-GCM encryption and decryption.
-- Authentication tag verification.
-- Invalid packet rejection.
-- Nonce uniqueness.
-- IP and TCP checksum validation.
-- File integrity verification using SHA-256.
+```bash
+git init
+git add .
+git commit -m "Add initial C networking project"
+git branch -M main
+git remote add origin https://github.com/YOUR_USERNAME/secure-inline-communication-channel.git
+git push -u origin main
+```
 
-## Development Status
+Replace `YOUR_USERNAME` with your GitHub username.
 
-**Project status: In development**
+## Planned milestones
 
-| Feature | Status |
-|---|---|
-| Network namespace setup | Planned |
-| TCP client/server | Planned |
-| X25519 key exchange | Planned |
-| HKDF key derivation | Planned |
-| AES-256-GCM | Planned |
-| Packet interception | Planned |
-| Packet restoration | Planned |
-| Integration testing | Planned |
+1. Verify the Linux VM and four-namespace topology.
+2. Verify the TCP file-transfer application.
+3. Complete and test the X25519/HKDF/AES-GCM cryptographic module.
+4. Agree on nonce/framing and TCP stream-handling design.
+5. Implement authenticated Device1–Device2 handshake.
+6. Implement NFQUEUE interception and packet processing.
+7. Integrate both directions, retransmission handling, checksums and MTU tests.
+8. Document results and capture test evidence.
 
-Implementation status will be updated as individual components are completed.
+## Security
 
-## Author
-
-Developed as a university Network Programming project.
-
-**Programming Language:** C  
-**Platform:** Linux
+This is an educational prototype. Do not use it to protect real production traffic. Do not commit private keys, pre-shared secrets, credentials, or sensitive test data.
