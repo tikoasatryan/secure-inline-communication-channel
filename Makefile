@@ -1,33 +1,32 @@
-CC := gcc
-CPPFLAGS := -Isrc/common
-CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2
-OPENSSL_LIBS := -lcrypto
-NFQUEUE_LIBS := -lnetfilter_queue -lmnl
+CC      ?= gcc
+CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11 -D_GNU_SOURCE
+INC     := -Isrc/common
+COMMON  := src/common/crypto.c src/common/packet.c src/common/channel.c
 
-BUILD := build
-COMMON_CRYPTO := src/common/crypto.c
+all: build/device build/sender build/receiver build/test_channel
 
-.PHONY: all clean test
+build:
+	mkdir -p build
 
-all: $(BUILD)/sender $(BUILD)/receiver $(BUILD)/test_crypto
+build/device: src/device/device.c $(COMMON) | build
+	$(CC) $(CFLAGS) $(INC) -o $@ $^ -lnetfilter_queue -lcrypto
 
-$(BUILD):
-	mkdir -p $(BUILD)
+build/sender: src/sender/sender.c | build
+	$(CC) $(CFLAGS) -o $@ $^
 
-$(BUILD)/sender: src/sender/client.c | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
+build/receiver: src/receiver/receiver.c | build
+	$(CC) $(CFLAGS) -o $@ $^
 
-$(BUILD)/receiver: src/receiver/server.c | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
+build/test_channel: tests/test_channel.c $(COMMON) | build
+	$(CC) $(CFLAGS) $(INC) -o $@ $^ -lcrypto
 
-$(BUILD)/test_crypto: tests/test_crypto.c $(COMMON_CRYPTO) src/common/crypto.h | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_crypto.c $(COMMON_CRYPTO) $(OPENSSL_LIBS) -o $@
+test: build/test_channel
+	./build/test_channel
 
-# NFQUEUE dependencies are installed now for the later packet-processing milestone.
-# Device programs are intentionally not built until packet logic is implemented.
-
-test: all
-	./$(BUILD)/test_crypto
+integration: all
+	sudo tests/run_integration.sh
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf build
+
+.PHONY: all test integration clean

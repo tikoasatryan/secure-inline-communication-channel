@@ -1,30 +1,42 @@
-#ifndef SIC_CRYPTO_H
-#define SIC_CRYPTO_H
+#ifndef CRYPTO_H
+#define CRYPTO_H
 
 #include <stddef.h>
 #include <stdint.h>
+#include <openssl/evp.h>
+#include "common.h"
 
-/* Generate an X25519 keypair. Caller owns both returned EVP_PKEY objects. */
-int sic_x25519_generate(void **private_key, uint8_t public_key[32]);
+typedef struct {
+    uint8_t key[KEY_LEN];
+    uint8_t salt[SALT_LEN];
+} dir_key_t;
 
-/* Derive a 32-byte X25519 shared secret from our private key and peer public key. */
-int sic_x25519_derive(void *private_key, const uint8_t peer_public_key[32],
-                     uint8_t shared_secret[32]);
+typedef struct {
+    dir_key_t tx;   /* used to encrypt packets we send to the peer   */
+    dir_key_t rx;   /* used to decrypt packets received from the peer */
+} session_t;
 
-/* Derive a 32-byte key using HKDF-SHA256. */
-int sic_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
-                    const uint8_t *salt, size_t salt_len,
-                    const uint8_t *info, size_t info_len,
-                    uint8_t output_key[32]);
+/* Diffie-Hellman (X25519) */
+int dh_generate(EVP_PKEY **kp, uint8_t pub[32]);
 
-/* AES-256-GCM. Nonce must be unique for each encryption under a given key.
-   Returns 1 on success, 0 on failure. Tag length is 16 bytes. */
-int sic_aes256gcm_encrypt(const uint8_t key[32], const uint8_t nonce[12],
-                          const uint8_t *plaintext, size_t plaintext_len,
-                          uint8_t *ciphertext, uint8_t tag[16]);
+/* shared secret -> HKDF-SHA256 -> per-direction keys/salts + confirmation key */
+int session_derive(EVP_PKEY *mine, const uint8_t peer_pub[32],
+                   const uint8_t client_pub[32], const uint8_t server_pub[32],
+                   int is_client, const char *psk,
+                   session_t *s, uint8_t confirm_key[32]);
 
-int sic_aes256gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12],
-                          const uint8_t *ciphertext, size_t ciphertext_len,
-                          const uint8_t tag[16], uint8_t *plaintext);
+int make_confirm(const uint8_t confirm_key[32], const char *label,
+                 const uint8_t client_pub[32], const uint8_t server_pub[32],
+                 uint8_t out[32]);
+
+void make_nonce(uint8_t nonce[NONCE_LEN], const uint8_t salt[SALT_LEN], uint64_t ctr);
+
+/* AES-256-GCM. Return 0 on success, -1 on failure (decrypt: bad tag). */
+int gcm_encrypt(const uint8_t key[KEY_LEN], const uint8_t nonce[NONCE_LEN],
+                const uint8_t *aad, int aad_len,
+                const uint8_t *pt, int len, uint8_t *ct, uint8_t tag[TAG_LEN]);
+int gcm_decrypt(const uint8_t key[KEY_LEN], const uint8_t nonce[NONCE_LEN],
+                const uint8_t *aad, int aad_len,
+                const uint8_t *ct, int len, const uint8_t tag[TAG_LEN], uint8_t *pt);
 
 #endif

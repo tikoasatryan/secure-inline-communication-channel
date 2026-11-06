@@ -1,177 +1,141 @@
 # Secure Inline Communication Channel
 
-A Linux-based C networking project prototype for a protected inline path:
+A Linux prototype of a secure inline channel between two hosts, written in C:
 
-```text
+```
 PC1  ->  Device1  ->  Device2  ->  PC2
+ plain TCP   encrypt     decrypt    plain TCP
 ```
 
-The repository is designed to be developed on macOS and executed inside a Linux VM. Linux network namespaces, veth interfaces and Netfilter/NFQUEUE require a Linux kernel; they cannot run natively on macOS.
+Device1 and Device2 intercept selected TCP/IPv4 packets (Netfilter NFQUEUE). They first
+establish a session key with an X25519 Diffie-Hellman handshake, then protect every TCP
+payload with AES-256-GCM. IP and TCP headers are kept, the GCM tag is appended to the
+encrypted payload, and no UDP encapsulation or custom header is used.
 
-## Current implementation status
+Linux network namespaces, veth and NFQUEUE need a Linux kernel. On macOS, run everything
+inside a Linux VM (see "Setup").
 
-This repository is a **starter implementation**, not a finished transparent inline encryptor.
+## Implementation status
 
-| Component | Status |
-|---|---|
-| Four-namespace topology script | Implemented |
-| TCP file sender and receiver in C | Implemented |
-| X25519 shared-secret test | Implemented |
-| HKDF-SHA256 key derivation | Implemented |
-| AES-256-GCM encrypt/decrypt test | Implemented |
-| NFQUEUE packet interception | Scaffold / next milestone |
-| Transparent TCP sequence/retransmission handling | Not implemented |
-| End-to-end inline integration | Not implemented |
-
-Do not describe the packet interception or transparent encryption features as complete until they have been implemented and tested.
-
-## Important design note
-
-The assignment asks to append a 16-byte GCM tag to each encrypted TCP payload while preserving the original IP and TCP headers and forwarding packets directly. Adding bytes to a TCP segment changes TCP sequence-space. A correct transparent implementation must also handle TCP sequence/acknowledgment translation, retransmissions, segmentation/coalescing, MTU limits, and both traffic directions. Simply changing a packet's payload length and checksum will not produce a reliable transparent TCP connection.
-
-The nonce must also be available to the receiver and must never repeat with the same AES-GCM key. The project documentation should state the nonce/framing design agreed with the instructor. X25519 alone does not authenticate peers; the handshake needs authentication (for example, a pre-shared-key-based transcript MAC or signatures).
+| Component                                              | Status      |
+|--------------------------------------------------------|-------------|
+| Four-namespace topology (`network/setup.sh`)           | Implemented |
+| TCP file sender / receiver in C                        | Implemented |
+| X25519 handshake between the devices (control channel) | Implemented |
+| HKDF-SHA256 key derivation, per-direction keys         | Implemented |
+| PSK-based key confirmation (anti-MITM)                 | Implemented |
+| NFQUEUE interception, both directions                  | Implemented |
+| AES-256-GCM on the TCP payload, tag appended           | Implemented |
+| Checksum recalculation (IP + TCP)                      | Implemented |
+| Unique nonce per packet + replay window                | Implemented |
+| Unit tests (`make test`)                               | Implemented |
+| End-to-end test (`make integration`)                   | Implemented |
 
 ## Repository layout
 
-```text
-network/       Linux namespace and veth setup/cleanup scripts
-src/common/    cryptographic helpers
+```
+src/common/    crypto.c (X25519, HKDF, AES-GCM), packet.c (parse, checksums), channel.c (protect / unprotect)
+src/device/    device.c - one program, used as Device1 (--role client) and Device2 (--role server)
 src/sender/    TCP file sender
 src/receiver/  TCP file receiver
-src/device1/   future NFQUEUE encryptor
-src/device2/   future NFQUEUE decryptor
-tests/         cryptographic and transfer tests
-docs/          architecture and implementation notes
+network/       setup.sh / cleanup.sh - namespaces, veth, routes, iptables rules
+tests/         test_channel.c (unit tests), run_integration.sh (end-to-end)
+docs/          design.md - protocol, packet format, nonce design, MTU notes
 ```
 
-## macOS development setup
+## Setup (macOS + Ubuntu VM)
 
-1. Install Git and a code editor such as VS Code on macOS.
-2. Install UTM: https://mac.getutm.app/
-3. Create an Ubuntu 24.04 ARM64 VM on Apple Silicon, or Ubuntu 24.04 x86_64 on an Intel Mac.
-4. Give the VM at least 2 CPU cores, 4 GB RAM and 25 GB disk.
-5. Boot Ubuntu and install the dependencies below.
-6. Copy this repository into the VM (shared folder, `git clone`, or ZIP transfer).
+1. Install UTM (https://mac.getutm.app/) and create an Ubuntu 24.04 VM
+   (ARM64 on Apple Silicon, x86_64 on Intel). 2+ CPU cores, 4 GB RAM, 25 GB disk.
+2. Inside the VM:
 
-The Linux VM is where all network namespace and NFQUEUE commands must run.
-
-### Install dependencies on Ubuntu
-
-```bash
+```
 sudo apt update
-sudo apt install -y build-essential gcc make git \
-  libssl-dev libnetfilter-queue-dev libmnl-dev \
-  iproute2 iptables nftables tcpdump ethtool
+sudo apt install -y build-essential git libssl-dev libnetfilter-queue-dev \
+  iproute2 iptables tcpdump ethtool iputils-ping
 ```
 
-## Build
+For the optional tamper test also: `sudo apt install linux-modules-extra-$(uname -r)` (netem).
 
-From the repository root:
+## Build and test
 
-```bash
-make
+```
+make                # builds build/device, build/sender, build/receiver, build/test_channel
+make test           # unit tests: no root, no network needed
+sudo make integration            # full PC1 -> Device1 -> Device2 -> PC2 test
+sudo tests/run_integration.sh --tamper   # also corrupts 2% of packets on the protected link
 ```
 
-This builds:
-- `build/sender`
-- `build/receiver`
-- `build/test_crypto`
+The integration test creates the topology, starts both devices, sends a ~900 KB text
+file from PC1 to PC2 and checks:
 
-## Run the basic TCP file-transfer test
+1. the received file has the same SHA-256 as the sent file,
+2. the plaintext marker is visible between PC1 and Device1 but **not** between Device1 and Device2,
+3. Device1 encrypted exactly as many packets as Device2 decrypted, with no duplicate counters,
+4. (tamper mode) corrupted packets are detected and dropped, and TCP still delivers the file.
 
-Open two Ubuntu terminal windows.
+Example output (from one run):
 
-Terminal 1 — start the receiver:
-
-```bash
-mkdir -p receiver
-./build/receiver 9000 receiver/received.bin
+```
+PASS: files identical
+host side  (PC1 <-> Device1)     : 14441 lines with SECRET-LINE (expected > 0)
+protected  (Device1 <-> Device2) : 0 lines with SECRET-LINE (expected 0)
+[client] stats: encrypted=682 decrypted=0 auth_fail=0 replay=0 dropped=0
+[server] stats: encrypted=0 decrypted=682 auth_fail=0 replay=0 dropped=0
+ALL CHECKS PASSED
 ```
 
-Terminal 2 — send a file:
+## Manual run
 
-```bash
-mkdir -p sender
-printf 'Hello from the secure inline channel project\n' > sender/example.txt
-./build/sender 127.0.0.1 9000 sender/example.txt
+```
+sudo network/setup.sh                    # topology + iptables rules (PORT=5000)
+
+# terminal 1 (Device2)
+sudo SC_PSK=secret ip netns exec device2 ./build/device --role server --ctrl-ip 10.0.12.2 -v
+# terminal 2 (Device1)
+sudo SC_PSK=secret ip netns exec device1 ./build/device --role client --ctrl-ip 10.0.12.2 -v
+# terminal 3 (PC2)
+sudo ip netns exec pc2 ./build/receiver 5000 receiver/received.txt
+# terminal 4 (PC1)
+printf 'hello from pc1\n' > sender/example.txt
+sudo ip netns exec pc1 ./build/sender 10.0.2.2 5000 sender/example.txt
+
+sudo ip netns exec device1 tcpdump -nn -A -i d1-d2     # protected link: unreadable payload
+sudo network/cleanup.sh
 ```
 
-Compare the files:
+## How the requirements are met
 
-```bash
-cmp sender/example.txt receiver/received.bin
-sha256sum sender/example.txt receiver/received.bin
-```
+| Requirement                                       | Where                                         |
+|---------------------------------------------------|-----------------------------------------------|
+| PC1 -> Device1 -> Device2 -> PC2                  | `network/setup.sh`                            |
+| Process selected TCP/IPv4 traffic                 | iptables rules + `parse_ipv4_tcp()`           |
+| Secure session before protected transmission      | `handshake()` in `device.c`; queues bind after it, unbound queues drop |
+| Diffie-Hellman shared session key                 | X25519 + HKDF in `crypto.c`                   |
+| Encrypt only the TCP payload with AES-GCM         | `channel_protect()`                           |
+| Keep IP/TCP headers, append tag, no UDP/header    | `channel.c`: ciphertext, tag, 8-byte counter  |
+| Verify tag, decrypt, restore, recompute checksums | `channel_unprotect()`, `fix_checksums()`      |
+| Unique nonce per packet in a session              | salt (4 B) + strictly increasing counter (8 B)|
 
-The hashes should match.
+See `docs/design.md` for the details.
 
-## Run the cryptographic self-test
+## Design decisions to mention in the report
 
-```bash
-./build/test_crypto
-```
+* **Nonce delivery.** The receiver needs the counter that forms the nonce. It is
+  appended after the tag (8 bytes), so a protected packet is 24 bytes larger. If your
+  instructor requires exactly +16 bytes, ask which nonce scheme they expect.
+* **No TCP sequence translation is needed.** The encrypted packet is never terminated
+  by a TCP stack, and Device2 restores the exact original packet.
+* **MTU.** The kernel checks the forwarding MTU before the FORWARD hook: PCs use MTU 1400,
+  devices 1500.
+* **Authentication.** Plain DH is vulnerable to a man-in-the-middle; a PSK + HMAC key
+  confirmation closes that gap.
 
-The test generates two X25519 key pairs, derives a common secret on both sides, derives an AES key using HKDF-SHA256, and checks AES-256-GCM encryption/decryption plus rejection of a modified tag.
+## Limitations
 
-## Create the virtual network
-
-Run only inside the Ubuntu VM:
-
-```bash
-sudo ./network/cleanup.sh
-sudo ./network/setup.sh
-```
-
-Check the namespaces and interfaces:
-
-```bash
-sudo ip netns list
-sudo ip netns exec pc1 ip addr
-sudo ip netns exec device1 ip addr
-sudo ip netns exec device2 ip addr
-sudo ip netns exec pc2 ip addr
-```
-
-Test routed connectivity:
-
-```bash
-sudo ip netns exec pc1 ping -c 3 10.0.2.2
-```
-
-At this milestone, traffic is routed normally. It is **not yet encrypted**.
-
-Remove the topology:
-
-```bash
-sudo ./network/cleanup.sh
-```
-
-## GitHub
-
-Create an empty repository on GitHub, then from this directory:
-
-```bash
-git init
-git add .
-git commit -m "Add initial C networking project"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/secure-inline-communication-channel.git
-git push -u origin main
-```
-
-Replace `YOUR_USERNAME` with your GitHub username.
-
-## Planned milestones
-
-1. Verify the Linux VM and four-namespace topology.
-2. Verify the TCP file-transfer application.
-3. Complete and test the X25519/HKDF/AES-GCM cryptographic module.
-4. Agree on nonce/framing and TCP stream-handling design.
-5. Implement authenticated Device1–Device2 handshake.
-6. Implement NFQUEUE interception and packet processing.
-7. Integrate both directions, retransmission handling, checksums and MTU tests.
-8. Document results and capture test evidence.
+IPv4/TCP only, IP fragments dropped, no rekeying (counter hard limit 2^48), one session
+per run. Educational prototype; do not protect real traffic with it.
 
 ## Security
 
-This is an educational prototype. Do not use it to protect real production traffic. Do not commit private keys, pre-shared secrets, credentials, or sensitive test data.
+Do not commit private keys, pre-shared secrets, credentials or sensitive test data.

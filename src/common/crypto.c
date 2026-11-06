@@ -1,176 +1,145 @@
 #include "crypto.h"
 
-#include <limits.h>
-#include <openssl/evp.h>
+#include <string.h>
+#include <openssl/crypto.h>
+#include <openssl/hmac.h>
 #include <openssl/kdf.h>
-#include <openssl/core_names.h>
-#include <openssl/params.h>
 
-int sic_x25519_generate(void **private_key, uint8_t public_key[32]) {
-    EVP_PKEY_CTX *ctx = NULL;
-    EVP_PKEY *key = NULL;
-    size_t public_len = 32;
-    int ok = 0;
+#define HKDF_LABEL "secure-channel v1"
 
-    if (!private_key || !public_key) return 0;
-    *private_key = NULL;
-
-    ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
-    if (!ctx || EVP_PKEY_keygen_init(ctx) <= 0 ||
-        EVP_PKEY_keygen(ctx, &key) <= 0 ||
-        EVP_PKEY_get_raw_public_key(key, public_key, &public_len) <= 0 ||
-        public_len != 32) {
-        goto cleanup;
-    }
-
-    *private_key = key;
-    key = NULL;
-    ok = 1;
-
-cleanup:
-    EVP_PKEY_free(key);
-    EVP_PKEY_CTX_free(ctx);
-    return ok;
+int dh_generate(EVP_PKEY **kp, uint8_t pub[32])
+{
+    EVP_PKEY_CTX *c = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    if (!c) return -1;
+    *kp = NULL;
+    int ok = EVP_PKEY_keygen_init(c) > 0 && EVP_PKEY_keygen(c, kp) > 0;
+    EVP_PKEY_CTX_free(c);
+    if (!ok) return -1;
+    size_t n = 32;
+    if (EVP_PKEY_get_raw_public_key(*kp, pub, &n) <= 0 || n != 32) return -1;
+    return 0;
 }
 
-int sic_x25519_derive(void *private_key, const uint8_t peer_public_key[32],
-                      uint8_t shared_secret[32]) {
-    EVP_PKEY *peer = NULL;
-    EVP_PKEY_CTX *ctx = NULL;
-    size_t secret_len = 32;
-    int ok = 0;
+static int hkdf(const uint8_t *ikm, size_t ikm_len,
+                const uint8_t *salt, size_t salt_len,
+                const uint8_t *info, size_t info_len,
+                uint8_t *out, size_t out_len)
+{
+    EVP_PKEY_CTX *c = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+    if (!c) return -1;
+    int ok = EVP_PKEY_derive_init(c) > 0
+          && EVP_PKEY_CTX_set_hkdf_md(c, EVP_sha256()) > 0
+          && EVP_PKEY_CTX_set1_hkdf_salt(c, salt, (int)salt_len) > 0
+          && EVP_PKEY_CTX_set1_hkdf_key(c, ikm, (int)ikm_len) > 0
+          && EVP_PKEY_CTX_add1_hkdf_info(c, info, (int)info_len) > 0
+          && EVP_PKEY_derive(c, out, &out_len) > 0;
+    EVP_PKEY_CTX_free(c);
+    return ok ? 0 : -1;
+}
 
-    if (!private_key || !peer_public_key || !shared_secret) return 0;
+int session_derive(EVP_PKEY *mine, const uint8_t peer_pub[32],
+                   const uint8_t client_pub[32], const uint8_t server_pub[32],
+                   int is_client, const char *psk,
+                   session_t *s, uint8_t confirm_key[32])
+{
+    EVP_PKEY *peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer_pub, 32);
+    if (!peer) return -1;
 
-    peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL,
-                                       peer_public_key, 32);
-    if (!peer) goto cleanup;
-
-    ctx = EVP_PKEY_CTX_new((EVP_PKEY *)private_key, NULL);
-    if (!ctx || EVP_PKEY_derive_init(ctx) <= 0 ||
-        EVP_PKEY_derive_set_peer(ctx, peer) <= 0 ||
-        EVP_PKEY_derive(ctx, shared_secret, &secret_len) <= 0 ||
-        secret_len != 32) {
-        goto cleanup;
-    }
-
-    ok = 1;
-
-cleanup:
-    EVP_PKEY_CTX_free(ctx);
+    uint8_t secret[32];
+    size_t sl = sizeof secret;
+    EVP_PKEY_CTX *c = EVP_PKEY_CTX_new(mine, NULL);
+    int ok = c && EVP_PKEY_derive_init(c) > 0
+               && EVP_PKEY_derive_set_peer(c, peer) > 0
+               && EVP_PKEY_derive(c, secret, &sl) > 0 && sl == 32;
+    EVP_PKEY_CTX_free(c);
     EVP_PKEY_free(peer);
-    return ok;
+    if (!ok) return -1;
+
+    static const uint8_t zero[32] = {0};           /* reject low-order points */
+    if (CRYPTO_memcmp(secret, zero, 32) == 0) return -1;
+
+    /* The transcript (both public keys) is bound into the key derivation. */
+    uint8_t info[sizeof(HKDF_LABEL) - 1 + 64];
+    memcpy(info, HKDF_LABEL, sizeof(HKDF_LABEL) - 1);
+    memcpy(info + sizeof(HKDF_LABEL) - 1, client_pub, 32);
+    memcpy(info + sizeof(HKDF_LABEL) - 1 + 32, server_pub, 32);
+
+    const char *salt = (psk && *psk) ? psk : "secure-channel-no-psk";
+
+    /* c2s key(32)+salt(4) | s2c key(32)+salt(4) | confirmation key(32) */
+    uint8_t okm[2 * (KEY_LEN + SALT_LEN) + 32];
+    if (hkdf(secret, 32, (const uint8_t *)salt, strlen(salt),
+             info, sizeof info, okm, sizeof okm) < 0) {
+        OPENSSL_cleanse(secret, sizeof secret);
+        return -1;
+    }
+    const uint8_t *c2s = okm, *s2c = okm + (KEY_LEN + SALT_LEN);
+    const uint8_t *tx = is_client ? c2s : s2c;
+    const uint8_t *rx = is_client ? s2c : c2s;
+    memcpy(s->tx.key, tx, KEY_LEN);  memcpy(s->tx.salt, tx + KEY_LEN, SALT_LEN);
+    memcpy(s->rx.key, rx, KEY_LEN);  memcpy(s->rx.salt, rx + KEY_LEN, SALT_LEN);
+    memcpy(confirm_key, okm + 2 * (KEY_LEN + SALT_LEN), 32);
+
+    OPENSSL_cleanse(secret, sizeof secret);
+    OPENSSL_cleanse(okm, sizeof okm);
+    return 0;
 }
 
-int sic_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
-                    const uint8_t *salt, size_t salt_len,
-                    const uint8_t *info, size_t info_len,
-                    uint8_t output_key[32]) {
-    EVP_KDF *kdf = NULL;
-    EVP_KDF_CTX *ctx = NULL;
-    OSSL_PARAM params[5];
-    char digest[] = "SHA256";
-    uint8_t empty = 0;
-    int ok = 0;
-
-    if (!ikm || ikm_len == 0 || !output_key) return 0;
-
-    kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
-    if (!kdf) goto cleanup;
-    ctx = EVP_KDF_CTX_new(kdf);
-    if (!ctx) goto cleanup;
-
-    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST,
-                                                  digest, 0);
-    params[1] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY,
-                                                   (void *)ikm, ikm_len);
-    params[2] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
-                                                   (void *)(salt ? salt : &empty), salt_len);
-    params[3] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO,
-                                                   (void *)(info ? info : &empty), info_len);
-    params[4] = OSSL_PARAM_construct_end();
-
-    if (EVP_KDF_derive(ctx, output_key, 32, params) <= 0) goto cleanup;
-    ok = 1;
-
-cleanup:
-    EVP_KDF_CTX_free(ctx);
-    EVP_KDF_free(kdf);
-    return ok;
+int make_confirm(const uint8_t confirm_key[32], const char *label,
+                 const uint8_t client_pub[32], const uint8_t server_pub[32],
+                 uint8_t out[32])
+{
+    uint8_t msg[16 + 64];
+    size_t ll = strlen(label);
+    if (ll > 16) return -1;
+    memcpy(msg, label, ll);
+    memcpy(msg + ll, client_pub, 32);
+    memcpy(msg + ll + 32, server_pub, 32);
+    unsigned int olen = 32;
+    return HMAC(EVP_sha256(), confirm_key, 32, msg, ll + 64, out, &olen) ? 0 : -1;
 }
 
-int sic_aes256gcm_encrypt(const uint8_t key[32], const uint8_t nonce[12],
-                          const uint8_t *plaintext, size_t plaintext_len,
-                          uint8_t *ciphertext, uint8_t tag[16]) {
-    EVP_CIPHER_CTX *ctx = NULL;
-    int out_len = 0, final_len = 0;
-    int ok = 0;
-
-    if (!key || !nonce || (!plaintext && plaintext_len) ||
-        (!ciphertext && plaintext_len) || !tag || plaintext_len > INT_MAX)
-        return 0;
-
-    ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return 0;
-
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
-        EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1)
-        goto cleanup;
-
-    if (plaintext_len &&
-        EVP_EncryptUpdate(ctx, ciphertext, &out_len,
-                          plaintext, (int)plaintext_len) != 1)
-        goto cleanup;
-
-    if (EVP_EncryptFinal_ex(ctx,
-            ciphertext ? ciphertext + out_len : NULL, &final_len) != 1)
-        goto cleanup;
-
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1)
-        goto cleanup;
-
-    ok = 1;
-
-cleanup:
-    EVP_CIPHER_CTX_free(ctx);
-    return ok;
+void make_nonce(uint8_t nonce[NONCE_LEN], const uint8_t salt[SALT_LEN], uint64_t ctr)
+{
+    memcpy(nonce, salt, SALT_LEN);
+    for (int i = 0; i < 8; i++)
+        nonce[SALT_LEN + i] = (uint8_t)(ctr >> (56 - 8 * i));
 }
 
-int sic_aes256gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12],
-                          const uint8_t *ciphertext, size_t ciphertext_len,
-                          const uint8_t tag[16], uint8_t *plaintext) {
-    EVP_CIPHER_CTX *ctx = NULL;
-    int out_len = 0, final_len = 0;
-    int ok = 0;
+int gcm_encrypt(const uint8_t key[KEY_LEN], const uint8_t nonce[NONCE_LEN],
+                const uint8_t *aad, int aad_len,
+                const uint8_t *pt, int len, uint8_t *ct, uint8_t tag[TAG_LEN])
+{
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+    if (!c) return -1;
+    int n = 0, ok = 0;
+    if (EVP_EncryptInit_ex(c, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1
+        && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL) == 1
+        && EVP_EncryptInit_ex(c, NULL, NULL, key, nonce) == 1
+        && EVP_EncryptUpdate(c, NULL, &n, aad, aad_len) == 1
+        && EVP_EncryptUpdate(c, ct, &n, pt, len) == 1
+        && EVP_EncryptFinal_ex(c, ct + n, &n) == 1
+        && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag) == 1)
+        ok = 1;
+    EVP_CIPHER_CTX_free(c);
+    return ok ? 0 : -1;
+}
 
-    if (!key || !nonce || (!ciphertext && ciphertext_len) ||
-        (!plaintext && ciphertext_len) || !tag || ciphertext_len > INT_MAX)
-        return 0;
-
-    ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return 0;
-
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
-        EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1)
-        goto cleanup;
-
-    if (ciphertext_len &&
-        EVP_DecryptUpdate(ctx, plaintext, &out_len,
-                          ciphertext, (int)ciphertext_len) != 1)
-        goto cleanup;
-
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void *)tag) != 1)
-        goto cleanup;
-
-    if (EVP_DecryptFinal_ex(ctx,
-            plaintext ? plaintext + out_len : NULL, &final_len) != 1)
-        goto cleanup;
-
-    ok = 1;
-
-cleanup:
-    EVP_CIPHER_CTX_free(ctx);
-    return ok;
+int gcm_decrypt(const uint8_t key[KEY_LEN], const uint8_t nonce[NONCE_LEN],
+                const uint8_t *aad, int aad_len,
+                const uint8_t *ct, int len, const uint8_t tag[TAG_LEN], uint8_t *pt)
+{
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+    if (!c) return -1;
+    int n = 0, fl = 0, ok = 0;
+    if (EVP_DecryptInit_ex(c, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1
+        && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL) == 1
+        && EVP_DecryptInit_ex(c, NULL, NULL, key, nonce) == 1
+        && EVP_DecryptUpdate(c, NULL, &n, aad, aad_len) == 1
+        && EVP_DecryptUpdate(c, pt, &n, ct, len) == 1
+        && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_TAG, TAG_LEN, (void *)tag) == 1
+        && EVP_DecryptFinal_ex(c, pt + n, &fl) > 0)   /* verifies the tag */
+        ok = 1;
+    EVP_CIPHER_CTX_free(c);
+    return ok ? 0 : -1;
 }
